@@ -1,31 +1,5 @@
 ## 1. 理論的課題・改善点 (Theoretical Issues)
 
-### Issue 1.1: ルーティング境界の閾値崩壊と意味論の乖離
-* **現状の欠陥:**
-  * 理論ドキュメントでは「cos ≈ 1 でSLERP」「cos ≈ 0 でDARE-TIES」「cos ≈ -1 でDARE-TIES」と定義されている。
-  * しかし実際の実装では `score > args.ortho_max (0.002)` の条件で無条件に `High-Similarity -> slerp` へルーティングされている。
-  * 幾何学的にコサイン類似度 `0.01`〜`0.2` 程度は「弱い相関」あるいは「ほぼ独立（直交に近い）」領域であり、決して「High-Similarity」ではない。この領域でパラメータ補間（SLERP）を行うと、互いの異なる特徴空間を無理やり平均化してしまい、表現の希釈を招くリスクがある。
-* **改善提案:**
-  * **3領域から4領域への再設計、または閾値の統計的導出:**
-    * `Conflict` ($Score < -\tau_{\text{ortho}}$): 干渉領域 $\to$ 強スパース化 DARE-TIES
-    * `Orthogonal` ($-\tau_{\text{ortho}} \le Score \le \tau_{\text{ortho}}$): 独立領域 $\to$ 弱スパース化 DARE-TIES
-    * `Moderate` ($\tau_{\text{ortho}} < Score < \tau_{\text{sim}}$): 緩相関領域 $\to$ Linear / Ties
-    * `High-Similarity` ($Score \ge \tau_{\text{sim}}$): 真の類似領域 $\to$ SLERP
-    * ※ 閾値 $\tau$ は固定値（0.002等）ではなく、全レイヤーのコサイン分布の中央値・標準偏差から動的に決定する相対的キャリブレーションを推奨。
----
-
-### Issue 1.2: DARE-TIES Density補正における因果の逆転
-* **現状の欠陥:**
-  * 式: $d_i^{(l)} \propto (1 + |Score_l|)$
-  * 衝突度が高い（$Score \to -1$）ほど、直交度補正係数が $2.0$ に向かって増大し、残存率（Density）を最大化する設計になっている。
-  * DARE/TIESの理論的根拠は「パラメータの重複衝突（Interference）を防ぐために重みをドロップしてスパース化する」ことにある。衝突が激しい層でDensityを引き上げる挙動は、相殺事故の発生確率を数学的に最大化させており、DAREの原理と真逆である。
-* **改善提案:**
-  * **衝突回避型Density補正の導入:**
-    $$d_i^{(l)} = \text{clip}\left( D_{\text{base}} \times \left( 1 - \beta \cdot \max(0, -Score_l) \right) \times \dots, D_{\text{min}}, D_{\text{max}} \right)$$
-    衝突（負の相関）が強い層ほどDensityを下げてスパース性を高め、直交〜微小正相関の層はベースDensityを維持するように符号と関数を反転させる。
-
----
-
 ### Issue 1.3: ノルム逆数補正におけるノイズ増幅リスク
 * **現状の欠陥:**
   * 式: $w_A \propto \frac{1}{\|v_A\|_2}$、および Densityにおける $\frac{\overline{\|v\|}}{\|v_i\|_2}$
