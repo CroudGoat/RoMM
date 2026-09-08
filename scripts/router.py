@@ -2,7 +2,7 @@
 """Routing of Model Merging (RoMM) Router & Parameter Calibrator.
 
 High-performance, ultra-low-memory implementation using safetensors get_slice()
-and BLAS-accelerated vector operations with dynamic output naming and YAML flags.
+and dimension-aware statistical hypothesis testing (Z-score routing).
 
 Dependencies:
     pip install torch safetensors huggingface_hub pyyaml
@@ -32,7 +32,6 @@ INDEX_FILENAME = "model.safetensors.index.json"
 def sanitize_identifier(name: str) -> str:
     """Sanitize model ID or path to a filesystem-safe string."""
     clean = name.strip("/").replace("\\", "/")
-    # Extract the last 1 or 2 parts for brevity and uniqueness (e.g. 'org__model' or 'model')
     parts = [p for p in clean.split("/") if p]
     target = "__".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
     return re.sub(r"[^\w\-.]", "_", target)
@@ -40,7 +39,7 @@ def sanitize_identifier(name: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="RoMM: High-performance Layer-wise Model Merging Router."
+        description="RoMM: Dimension-Aware Statistical Model Merging Router."
     )
     parser.add_argument("--base", required=True, help="Base model repo ID or local path")
     parser.add_argument("--model-a", required=True, help="Model A repo ID or local path")
@@ -65,7 +64,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Explicit YAML output path (overrides dynamic naming)",
     )
-    # YAML generation flag (--yaml / --no-yaml)
     parser.add_argument(
         "--yaml",
         action=argparse.BooleanOptionalAction,
@@ -85,17 +83,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_LAYER_PATTERN,
         help="Regex for layer index",
     )
+    # Dimension-Aware Statistical Thresholds (Z-score multipliers)
     parser.add_argument(
-        "--ortho-min",
+        "--z-slerp",
         type=float,
-        default=-0.002,
-        help="Orthogonal range min",
+        default=15.0,
+        help="Z-score threshold for High-Similarity (SLERP) routing (default: 15.0 sigma)",
     )
     parser.add_argument(
-        "--ortho-max",
+        "--z-conflict",
         type=float,
-        default=0.002,
-        help="Orthogonal range max",
+        default=3.0,
+        help="Z-score threshold for Conflicting (Strong-Sparse) routing (default: 3.0 sigma, z < -3.0)",
     )
     parser.add_argument(
         "--base-density",
@@ -251,7 +250,6 @@ def sanitize(val: Optional[float]) -> Optional[float]:
 def main() -> int:
     args = parse_args()
 
-    # Dynamic naming resolution
     tag_base = sanitize_identifier(args.base)
     tag_a = sanitize_identifier(args.model_a)
     tag_b = sanitize_identifier(args.model_b)
@@ -316,15 +314,21 @@ def main() -> int:
 
     mean_norm = sum(all_norms) / len(all_norms) if all_norms else 1.0
 
-    print("[3/4] Routing and parameter calibration...")
+    print("[3/4] Statistical routing & parameter calibration...")
     results = []
     for layer_id, score, norm_a, norm_b, elements, param_count in raw_stats:
-        if score > args.ortho_max:
+        sigma_d = 1.0 / math.sqrt(elements) if elements > 0 else 1.0
+        z_score = score / sigma_d
+
+        tau_slerp = args.z_slerp * sigma_d
+        tau_conflict = -args.z_conflict * sigma_d
+
+        if z_score >= args.z_slerp:
             cat, method = "High-Similarity", "slerp"
-        elif score < args.ortho_min:
+        elif z_score < -args.z_conflict:
             cat, method = "Conflicting", "dare_ties"
         else:
-            cat, method = "Orthogonal", "dare_ties"
+            cat, method = "Orthogonal/Moderate", "dare_ties"
 
         slerp_t = norm_a / (norm_a + norm_b) if (norm_a + norm_b) > 0 else 0.5
 
@@ -339,6 +343,8 @@ def main() -> int:
         results.append({
             "layer": layer_id,
             "cosine_similarity": score,
+            "sigma_d": sigma_d,
+            "z_score": z_score,
             "category": cat,
             "recommended_method": method,
             "norm_a": norm_a,
@@ -351,22 +357,28 @@ def main() -> int:
             "dare_density_b": d_b,
             "parameter_tensors": param_count,
             "elements": elements,
+            "dynamic_tau_slerp": tau_slerp,
+            "dynamic_tau_conflict": tau_conflict,
         })
 
     # Display Table
-    print("\n" + "=" * 115)
-    print(f" RoMM Routing Summary (Ortho: [{args.ortho_min}, {args.ortho_max}], Mean ||v||: {mean_norm:.4f})")
-    print("=" * 115)
-    print(f"{'Layer':<6} | {'Cosine':<12} | {'Category':<16} | {'Method':<10} | {'||dA||':<8} | {'||dB||':<8} | Calibrated Parameters")
-    print("-" * 115)
+    print("\n" + "=" * 125)
+    print(f" RoMM Statistical Routing Summary (Z_slerp: +{args.z_slerp}σ, Z_conflict: -{args.z_conflict}σ, Mean ||v||: {mean_norm:.4f})")
+    print("=" * 125)
+    print(f"{'Layer':<6} | {'Cosine':<11} | {'Z-score':<9} | {'Category':<19} | {'Method':<10} | {'||dA||':<7} | {'||dB||':<7} | Calibrated Parameters")
+    print("-" * 125)
     for r in results:
         param_str = (
             f"t={r['slerp_t']:.4f}"
             if r["recommended_method"] == "slerp"
             else f"w=[A:{r['dare_weight_a']:.3f}, B:{r['dare_weight_b']:.3f}] d=[A:{r['dare_density_a']:.3f}, B:{r['dare_density_b']:.3f}]"
         )
-        print(f"L{r['layer']:<5} | {r['cosine_similarity']:+10.6f} | {r['category']:<16} | {r['recommended_method'].upper():<10} | {r['norm_a']:<8.4f} | {r['norm_b']:<8.4f} | {param_str}")
-    print("=" * 115 + "\n")
+        print(
+            f"L{r['layer']:<5} | {r['cosine_similarity']:+10.6f} | {r['z_score']:+7.2f}σ | "
+            f"{r['category']:<19} | {r['recommended_method'].upper():<10} | "
+            f"{r['norm_a']:<7.4f} | {r['norm_b']:<7.4f} | {param_str}"
+        )
+    print("=" * 125 + "\n")
 
     # Write CSV & JSON
     print("[4/4] Writing output files...")
@@ -387,7 +399,8 @@ def main() -> int:
             "resolved_model_b": str(b_dir),
         },
         "config": {
-            "ortho_range": [args.ortho_min, args.ortho_max],
+            "z_slerp": args.z_slerp,
+            "z_conflict": args.z_conflict,
             "base_density": args.base_density,
             "alpha_a": args.alpha_a,
             "alpha_b": args.alpha_b,
@@ -402,7 +415,7 @@ def main() -> int:
         json.dump(json_data, f, ensure_ascii=False, indent=2)
     print(f"  JSON: {json_path}")
 
-    # Conditional YAML Generation
+    # Mergekit YAML Generation with Proper Global Top-level Header
     if args.yaml:
         slices = []
         for r in results:
@@ -439,22 +452,38 @@ def main() -> int:
                     "merge_method": "dare_ties",
                 })
 
+        yaml_dict = {
+            "merge_method": "slerp",
+            "base_model": args.base,
+            "dtype": "bfloat16",
+            "parameters": {"t": 0.5},
+            "slices": slices,
+        }
+
         try:
             import yaml
             with yaml_path.open("w", encoding="utf-8") as f:
-                yaml.dump({"base_model": args.base, "dtype": "bfloat16", "slices": slices}, f, sort_keys=False)
+                yaml.dump(yaml_dict, f, sort_keys=False)
         except ImportError:
             with yaml_path.open("w", encoding="utf-8") as f:
-                f.write(f"base_model: {args.base}\ndtype: bfloat16\nslices:\n")
+                f.write("merge_method: slerp\n")
+                f.write(f"base_model: {args.base}\n")
+                f.write("dtype: bfloat16\n")
+                f.write("parameters:\n  t: 0.5\n")
+                f.write("slices:\n")
                 for s in slices:
-                    f.write(f"  - merge_method: {s['merge_method']}\n")
-                    if "parameters" in s:
-                        f.write(f"    parameters:\n      t: {s['parameters']['t']}\n")
-                    f.write("    sources:\n")
+                    f.write("- sources:\n")
                     for src in s["sources"]:
-                        f.write(f"      - model: {src['model']}\n        layer_range: {src['layer_range']}\n")
+                        f.write(f"  - model: {src['model']}\n")
+                        f.write(f"    layer_range:\n    - {src['layer_range'][0]}\n    - {src['layer_range'][1]}\n")
                         if "parameters" in src:
-                            f.write(f"        parameters:\n          weight: {src['parameters']['weight']}\n          density: {src['parameters']['density']}\n")
+                            f.write("    parameters:\n")
+                            f.write(f"      weight: {src['parameters']['weight']}\n")
+                            f.write(f"      density: {src['parameters']['density']}\n")
+                    f.write(f"  merge_method: {s['merge_method']}\n")
+                    if "parameters" in s:
+                        f.write("  parameters:\n")
+                        f.write(f"    t: {s['parameters']['t']}\n")
         print(f"  YAML: {yaml_path}")
     else:
         print("  YAML: Skipped (--no-yaml specified)")
