@@ -51,12 +51,18 @@ $$t^{(l)} = \text{clip}\left( t_{\text{raw}}^{(l)}, \quad 0.20, \quad 0.80 \righ
 
 ##### Density parameter
 モデルのレイヤー $l$ をマージする際のDARE-TIES Densityパラメータは、衝突の激しさ（severity）に対する線形ペナルティ関数として決定する。
-$$\text{severity}_l = \max(0.0, -Z_l)$$
-$$\text{penalty}_l = \max\left(0.25, \quad 1.0 - 0.75 \times \frac{\text{severity}_l}{15.0}\right)$$
-$$d^{(l)} = \text{clip}\left( D_{\text{base}} \times \text{penalty}_l, \quad \underbrace{0.05}_{\text{下限}}, \quad \underbrace{0.50}_{\text{上限}} \right)$$
 
-- $D_{\text{base}}$: 基準密度（デフォルト値。通常 `0.20`＝残存率20%）
+$$
+\begin{aligned}
+\mathrm{severity}_l &= \max(0.0, -Z_l) \\
+\mathrm{penalty}_l &= \max\left(0.25, \quad 1.0 - 0.75 \times \frac{\mathrm{severity}_l}{15.0}\right) \\
+d^{(l)} &= \mathrm{clip}\left( D_{\mathrm{base}} \times \mathrm{penalty}_l, \quad 0.05, \quad 0.50 \right)
+\end{aligned}
+$$
+
+- $D_{\mathrm{base}}$: 基準密度（デフォルト値。通常 `0.20`＝残存率20%）
 - $Z_l$: レイヤー $l$ の統計的 $Z$ スコア
+- クリップ範囲 $[0.05, 0.50]$: 下限 $0.05$（過剰スパース防止）、上限 $0.50$（過剰密度防止）
 
 直交〜正相関領域（$Z_l \ge 0$）ではペナルティは発生せず、基準密度 $D_{\text{base}}$ が維持される。一方、衝突（$Z_l < 0$）が激しくなるほどペナルティが強まり、Densityを削ってスパース性を高める。これにより、対立するパラメータ同士の相殺事故を確率論的に最小化する。
 
