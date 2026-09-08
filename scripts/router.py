@@ -100,19 +100,19 @@ def parse_args() -> argparse.Namespace:
         "--base-density",
         type=float,
         default=0.20,
-        help="Base density (D_base)",
+        help="Base density (D_base) for DARE-TIES (default: 0.20)",
     )
     parser.add_argument(
         "--alpha-a",
         type=float,
         default=1.0,
-        help="Model A user priority",
+        help="Model A user priority multiplier (default: 1.0)",
     )
     parser.add_argument(
         "--alpha-b",
         type=float,
         default=1.0,
-        help="Model B user priority",
+        help="Model B user priority multiplier (default: 1.0)",
     )
     return parser.parse_args()
 
@@ -316,13 +316,20 @@ def main() -> int:
 
     print("[3/4] Statistical routing & parameter calibration...")
     results = []
+
+    # Constants for Conflict Penalty Function
+    Z_SCALE = 15.0
+    BETA = 0.75
+
     for layer_id, score, norm_a, norm_b, elements, param_count in raw_stats:
+        # High-dimensional statistical noise scale: sigma_D = 1 / sqrt(D)
         sigma_d = 1.0 / math.sqrt(elements) if elements > 0 else 1.0
         z_score = score / sigma_d
 
         tau_slerp = args.z_slerp * sigma_d
         tau_conflict = -args.z_conflict * sigma_d
 
+        # 1. Routing Decision (Issue 1.1)
         if z_score >= args.z_slerp:
             cat, method = "High-Similarity", "slerp"
         elif z_score < -args.z_conflict:
@@ -330,15 +337,27 @@ def main() -> int:
         else:
             cat, method = "Orthogonal/Moderate", "dare_ties"
 
-        slerp_t = norm_a / (norm_a + norm_b) if (norm_a + norm_b) > 0 else 0.5
+        # 2. SLERP t Parameter (Issue 1.3: Equalizing with Guardrails [0.20, 0.80])
+        norm_sum = norm_a + norm_b
+        if norm_sum > 1e-9:
+            slerp_t_raw = norm_a / norm_sum
+            slerp_t = max(0.20, min(slerp_t_raw, 0.80))
+        else:
+            slerp_t = 0.50
 
+        # 3. DARE-TIES Weight Parameter (Issue 1.4: Inverse Norm Equalizing with Guardrails [0.15, 0.85])
         w_denom = (args.alpha_a * norm_b) + (args.alpha_b * norm_a)
-        w_a = (args.alpha_a * norm_b) / w_denom if w_denom > 0 else 0.5
-        w_b = (args.alpha_b * norm_a) / w_denom if w_denom > 0 else 0.5
+        if w_denom > 1e-9:
+            w_a_raw = (args.alpha_a * norm_b) / w_denom
+            w_a = max(0.15, min(w_a_raw, 0.85))
+            w_b = 1.0 - w_a
+        else:
+            w_a = w_b = 0.50
 
-        ortho_factor = 1.0 + abs(score)
-        d_a = max(0.05, min(args.base_density * ortho_factor * (mean_norm / norm_a if norm_a > 0 else 1.0), 0.50))
-        d_b = max(0.05, min(args.base_density * ortho_factor * (mean_norm / norm_b if norm_b > 0 else 1.0), 0.50))
+        # 4. DARE-TIES Density Parameter (Issue 1.2: Pure Conflict Penalty, Clamped [0.05, 0.50])
+        conflict_severity = max(0.0, -z_score)
+        penalty_factor = max(0.25, 1.0 - (BETA * (conflict_severity / Z_SCALE)))
+        dare_density = max(0.05, min(args.base_density * penalty_factor, 0.50))
 
         results.append({
             "layer": layer_id,
@@ -353,15 +372,14 @@ def main() -> int:
             "slerp_t": slerp_t,
             "dare_weight_a": w_a,
             "dare_weight_b": w_b,
-            "dare_density_a": d_a,
-            "dare_density_b": d_b,
+            "dare_density": dare_density,
             "parameter_tensors": param_count,
             "elements": elements,
             "dynamic_tau_slerp": tau_slerp,
             "dynamic_tau_conflict": tau_conflict,
         })
 
-    # Display Table
+    # Display Table with Z-score & Statistical Scale
     print("\n" + "=" * 125)
     print(f" RoMM Statistical Routing Summary (Z_slerp: +{args.z_slerp}σ, Z_conflict: -{args.z_conflict}σ, Mean ||v||: {mean_norm:.4f})")
     print("=" * 125)
@@ -371,7 +389,7 @@ def main() -> int:
         param_str = (
             f"t={r['slerp_t']:.4f}"
             if r["recommended_method"] == "slerp"
-            else f"w=[A:{r['dare_weight_a']:.3f}, B:{r['dare_weight_b']:.3f}] d=[A:{r['dare_density_a']:.3f}, B:{r['dare_density_b']:.3f}]"
+            else f"w=[A:{r['dare_weight_a']:.3f}, B:{r['dare_weight_b']:.3f}] d={r['dare_density']:.3f}"
         )
         print(
             f"L{r['layer']:<5} | {r['cosine_similarity']:+10.6f} | {r['z_score']:+7.2f}σ | "
@@ -437,7 +455,7 @@ def main() -> int:
                             "layer_range": [idx, idx + 1],
                             "parameters": {
                                 "weight": round(r["dare_weight_a"], 4),
-                                "density": round(r["dare_density_a"], 4),
+                                "density": round(r["dare_density"], 4),
                             },
                         },
                         {
@@ -445,7 +463,7 @@ def main() -> int:
                             "layer_range": [idx, idx + 1],
                             "parameters": {
                                 "weight": round(r["dare_weight_b"], 4),
-                                "density": round(r["dare_density_b"], 4),
+                                "density": round(r["dare_density"], 4),
                             },
                         },
                     ],
