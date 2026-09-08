@@ -1,0 +1,12 @@
+AGENTS.md
+DOCS.md
+
+
+*.safetensors
+*.bin
+*.pt
+for-agents/
+results/
+output_models/
+similarity/
+tests/
