@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Routing of Model Merging (RoMM) Router & Parameter Calibrator.
 
-High-performance, ultra-low-memory implementation using safetensors get_slice()
-and dimension-aware statistical hypothesis testing (Z-score routing).
+High-performance, low-memory implementation using safetensors streaming,
+Stable Rank estimation via Power Iteration, and dimension-aware statistical routing.
 
 Dependencies:
     pip install torch safetensors huggingface_hub pyyaml
@@ -83,18 +83,30 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_LAYER_PATTERN,
         help="Regex for layer index",
     )
-    # Dimension-Aware Statistical Thresholds (Z-score multipliers)
+    # Statistical & Effective Dimension options (Calibrated for Stable Rank)
+    parser.add_argument(
+        "--use-stable-rank",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use Effective Dimension via Stable Rank instead of physical elements (default: True)",
+    )
+    parser.add_argument(
+        "--power-iters",
+        type=int,
+        default=5,
+        help="Number of power iterations for spectral norm estimation (default: 5)",
+    )
     parser.add_argument(
         "--z-slerp",
         type=float,
-        default=15.0,
-        help="Z-score threshold for High-Similarity (SLERP) routing (default: 15.0 sigma)",
+        default=2.5,
+        help="Z-score threshold for High-Similarity (SLERP) routing (default: 2.5 sigma)",
     )
     parser.add_argument(
         "--z-conflict",
         type=float,
-        default=3.0,
-        help="Z-score threshold for Conflicting (Strong-Sparse) routing (default: 3.0 sigma, z < -3.0)",
+        default=2.0,
+        help="Z-score threshold for Conflicting (Strong-Sparse) routing (default: 2.0 sigma, z < -2.0)",
     )
     parser.add_argument(
         "--base-density",
@@ -211,9 +223,57 @@ class SliceReader:
         self.close()
 
 
+def estimate_spectral_norm_power_iter(mat: torch.Tensor, iters: int = 5) -> float:
+    """Ultra-fast spectral norm (sigma_max) estimation using power iteration."""
+    if mat.ndim == 1:
+        return torch.norm(mat, p=2).item()
+
+    m2d = mat.flatten(1).float()
+    out_dim, in_dim = m2d.shape
+    if out_dim == 0 or in_dim == 0:
+        return 0.0
+
+    generator = torch.Generator(device="cpu").manual_seed(42)
+    v = torch.randn(in_dim, 1, generator=generator, dtype=m2d.dtype)
+    v = v / (torch.norm(v) + 1e-12)
+
+    for _ in range(iters):
+        u = torch.matmul(m2d, v)
+        u_norm = torch.norm(u)
+        if u_norm < 1e-12:
+            return 0.0
+        u = u / u_norm
+
+        v = torch.matmul(m2d.T, u)
+        v_norm = torch.norm(v)
+        if v_norm < 1e-12:
+            return 0.0
+        v = v / v_norm
+
+    sigma_max = torch.norm(torch.matmul(m2d, v)).item()
+    return sigma_max
+
+
+def compute_tensor_stable_rank(delta: torch.Tensor, iters: int = 5) -> float:
+    """Calculate Stable Rank = ||W||_F^2 / ||W||_2^2."""
+    fro_sq = torch.sum(delta.float() ** 2).item()
+    if fro_sq < 1e-12:
+        return 1.0
+
+    sigma_max = estimate_spectral_norm_power_iter(delta, iters=iters)
+    sigma_max_sq = sigma_max ** 2
+
+    if sigma_max_sq < 1e-12:
+        return 1.0
+
+    srank = fro_sq / sigma_max_sq
+    return max(1.0, srank)
+
+
 def stream_tensor_stats(
-    base_slice, a_slice, b_slice, chunk_elements: int
-) -> tuple[float, float, float, int]:
+    base_slice, a_slice, b_slice, chunk_elements: int, power_iters: int = 5
+) -> tuple[float, float, float, int, float, float]:
+    """Extract dot, norms, element count, and stable ranks via power iteration."""
     shape = base_slice.get_shape()
     if shape != a_slice.get_shape() or shape != b_slice.get_shape():
         raise ValueError(f"Shape mismatch: {shape}")
@@ -240,7 +300,16 @@ def stream_tensor_stats(
 
         del base_chunk, da, db
 
-    return dot, norm_a_sq, norm_b_sq, total_elements
+    t_base = base_slice[:].float()
+    t_da = a_slice[:].float() - t_base
+    t_db = b_slice[:].float() - t_base
+    del t_base
+
+    srank_a = compute_tensor_stable_rank(t_da, iters=power_iters)
+    srank_b = compute_tensor_stable_rank(t_db, iters=power_iters)
+    del t_da, t_db
+
+    return dot, norm_a_sq, norm_b_sq, total_elements, srank_a, srank_b
 
 
 def sanitize(val: Optional[float]) -> Optional[float]:
@@ -286,7 +355,10 @@ def main() -> int:
     layers = extract_common_layers([base_map, a_map, b_map], args.layer_pattern)
     print(f"  Common layers: {len(layers)} (L{min(layers)}..L{max(layers)})")
 
-    print("[2/4] Streaming geometric feature extraction (Low-RAM & BLAS)...")
+    print(
+        f"[2/4] Streaming geometric features & Stable Rank estimation "
+        f"(Power iters: {args.power_iters})..."
+    )
     raw_stats = []
     all_norms = []
 
@@ -294,42 +366,56 @@ def main() -> int:
         for layer_id, keys in layers.items():
             dot = norm_a_sq = norm_b_sq = 0.0
             layer_elements = 0
+            layer_srank_a_sum = 0.0
+            layer_srank_b_sum = 0.0
 
             for key in keys:
-                d, na, nb, count = stream_tensor_stats(
-                    br.get_slice(key), ar.get_slice(key), lr.get_slice(key), args.chunk_elements
+                d, na, nb, count, sra, srb = stream_tensor_stats(
+                    br.get_slice(key),
+                    ar.get_slice(key),
+                    lr.get_slice(key),
+                    args.chunk_elements,
+                    power_iters=args.power_iters,
                 )
                 dot += d
                 norm_a_sq += na
                 norm_b_sq += nb
                 layer_elements += count
+                layer_srank_a_sum += sra
+                layer_srank_b_sum += srb
 
             denom = math.sqrt(norm_a_sq) * math.sqrt(norm_b_sq)
             cosine = max(-1.0, min(1.0, dot / denom)) if denom > 0.0 else 0.0
             norm_a = math.sqrt(max(norm_a_sq, 0.0))
             norm_b = math.sqrt(max(norm_b_sq, 0.0))
 
+            layer_d_eff = (layer_srank_a_sum + layer_srank_b_sum) / 2.0
+
             all_norms.extend([norm_a, norm_b])
-            raw_stats.append((layer_id, cosine, norm_a, norm_b, layer_elements, len(keys)))
+            raw_stats.append((
+                layer_id,
+                cosine,
+                norm_a,
+                norm_b,
+                layer_elements,
+                layer_d_eff,
+                len(keys),
+            ))
 
     mean_norm = sum(all_norms) / len(all_norms) if all_norms else 1.0
 
     print("[3/4] Statistical routing & parameter calibration...")
     results = []
 
-    # Constants for Conflict Penalty Function
-    Z_SCALE = 15.0
-    BETA = 0.75
-
-    for layer_id, score, norm_a, norm_b, elements, param_count in raw_stats:
-        # High-dimensional statistical noise scale: sigma_D = 1 / sqrt(D)
-        sigma_d = 1.0 / math.sqrt(elements) if elements > 0 else 1.0
+    for layer_id, score, norm_a, norm_b, elements, d_eff, param_count in raw_stats:
+        active_dim = d_eff if args.use_stable_rank else float(elements)
+        sigma_d = 1.0 / math.sqrt(active_dim) if active_dim > 0 else 1.0
         z_score = score / sigma_d
 
         tau_slerp = args.z_slerp * sigma_d
         tau_conflict = -args.z_conflict * sigma_d
 
-        # 1. Routing Decision (Issue 1.1)
+        # 1. Routing Decision based on calibrated Z-thresholds
         if z_score >= args.z_slerp:
             cat, method = "High-Similarity", "slerp"
         elif z_score < -args.z_conflict:
@@ -337,26 +423,33 @@ def main() -> int:
         else:
             cat, method = "Orthogonal/Moderate", "dare_ties"
 
-        # 2. SLERP t Parameter (Issue 1.3: Equalizing with Guardrails [0.20, 0.80])
+        # 2. SLERP t Parameter (Fixed: Model A dominant -> t -> 0, Model B dominant -> t -> 1)
         norm_sum = norm_a + norm_b
-        if norm_sum > 1e-9:
-            slerp_t_raw = norm_a / norm_sum
+        if norm_sum > 1e-6:
+            slerp_t_raw = norm_b / norm_sum
             slerp_t = max(0.20, min(slerp_t_raw, 0.80))
         else:
             slerp_t = 0.50
 
-        # 3. DARE-TIES Weight Parameter (Issue 1.4: Inverse Norm Equalizing with Guardrails [0.15, 0.85])
+        # 3. DARE-TIES Weight Parameter with Guardrails [0.15, 0.85]
         w_denom = (args.alpha_a * norm_b) + (args.alpha_b * norm_a)
-        if w_denom > 1e-9:
+        if w_denom > 1e-6:
             w_a_raw = (args.alpha_a * norm_b) / w_denom
             w_a = max(0.15, min(w_a_raw, 0.85))
             w_b = 1.0 - w_a
         else:
             w_a = w_b = 0.50
 
-        # 4. DARE-TIES Density Parameter (Issue 1.2: Pure Conflict Penalty, Clamped [0.05, 0.50])
-        conflict_severity = max(0.0, -z_score)
-        penalty_factor = max(0.25, 1.0 - (BETA * (conflict_severity / Z_SCALE)))
+        # 4. Adaptive DARE-TIES Density Parameter
+        # Penalize density progressively when z_score falls below -z_conflict
+        if z_score < -args.z_conflict:
+            excess_conflict = (-z_score) - args.z_conflict
+            scale_range = max(1.0, args.z_conflict * 2.0)
+            penalty_ratio = min(1.0, excess_conflict / scale_range)
+            penalty_factor = 1.0 - (0.75 * penalty_ratio)
+        else:
+            penalty_factor = 1.0
+
         dare_density = max(0.05, min(args.base_density * penalty_factor, 0.50))
 
         results.append({
@@ -373,18 +466,25 @@ def main() -> int:
             "dare_weight_a": w_a,
             "dare_weight_b": w_b,
             "dare_density": dare_density,
+            "effective_dim": d_eff,
+            "physical_elements": elements,
             "parameter_tensors": param_count,
-            "elements": elements,
             "dynamic_tau_slerp": tau_slerp,
             "dynamic_tau_conflict": tau_conflict,
         })
 
-    # Display Table with Z-score & Statistical Scale
-    print("\n" + "=" * 125)
-    print(f" RoMM Statistical Routing Summary (Z_slerp: +{args.z_slerp}σ, Z_conflict: -{args.z_conflict}σ, Mean ||v||: {mean_norm:.4f})")
-    print("=" * 125)
-    print(f"{'Layer':<6} | {'Cosine':<11} | {'Z-score':<9} | {'Category':<19} | {'Method':<10} | {'||dA||':<7} | {'||dB||':<7} | Calibrated Parameters")
-    print("-" * 125)
+    print("\n" + "=" * 135)
+    dim_type = "Stable Rank (D_eff)" if args.use_stable_rank else "Physical Elements (D)"
+    print(
+        f" RoMM Statistical Routing Summary [{dim_type}] "
+        f"(Z_slerp: +{args.z_slerp}σ, Z_conflict: -{args.z_conflict}σ, Mean ||v||: {mean_norm:.4f})"
+    )
+    print("=" * 135)
+    print(
+        f"{'Layer':<6} | {'Cosine':<11} | {'D_eff':<8} | {'Z-score':<9} | "
+        f"{'Category':<19} | {'Method':<10} | {'||dA||':<7} | {'||dB||':<7} | Calibrated Parameters"
+    )
+    print("-" * 135)
     for r in results:
         param_str = (
             f"t={r['slerp_t']:.4f}"
@@ -392,13 +492,12 @@ def main() -> int:
             else f"w=[A:{r['dare_weight_a']:.3f}, B:{r['dare_weight_b']:.3f}] d={r['dare_density']:.3f}"
         )
         print(
-            f"L{r['layer']:<5} | {r['cosine_similarity']:+10.6f} | {r['z_score']:+7.2f}σ | "
-            f"{r['category']:<19} | {r['recommended_method'].upper():<10} | "
+            f"L{r['layer']:<5} | {r['cosine_similarity']:+10.6f} | {r['effective_dim']:<8.1f} | "
+            f"{r['z_score']:+7.2f}σ | {r['category']:<19} | {r['recommended_method'].upper():<10} | "
             f"{r['norm_a']:<7.4f} | {r['norm_b']:<7.4f} | {param_str}"
         )
-    print("=" * 125 + "\n")
+    print("=" * 135 + "\n")
 
-    # Write CSV & JSON
     print("[4/4] Writing output files...")
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(results[0].keys()))
@@ -417,6 +516,8 @@ def main() -> int:
             "resolved_model_b": str(b_dir),
         },
         "config": {
+            "use_stable_rank": args.use_stable_rank,
+            "power_iters": args.power_iters,
             "z_slerp": args.z_slerp,
             "z_conflict": args.z_conflict,
             "base_density": args.base_density,
@@ -433,7 +534,6 @@ def main() -> int:
         json.dump(json_data, f, ensure_ascii=False, indent=2)
     print(f"  JSON: {json_path}")
 
-    # Mergekit YAML Generation with Proper Global Top-level Header
     if args.yaml:
         slices = []
         for r in results:
@@ -445,6 +545,7 @@ def main() -> int:
                         {"model": args.model_b, "layer_range": [idx, idx + 1]},
                     ],
                     "merge_method": "slerp",
+                    "base_model": args.model_a,
                     "parameters": {"t": round(r["slerp_t"], 4)},
                 })
             else:
@@ -468,13 +569,15 @@ def main() -> int:
                         },
                     ],
                     "merge_method": "dare_ties",
+                    "base_model": args.base,
                 })
 
+        # Top-level fallback uses 'linear' to safely blend non-Transformer layers
+        # (embeddings, norms, lm_head) without triggering base_model missing errors.
         yaml_dict = {
-            "merge_method": "slerp",
-            "base_model": args.base,
+            "merge_method": "linear",
             "dtype": "bfloat16",
-            "parameters": {"t": 0.5},
+            "parameters": {"weight": 0.5},
             "slices": slices,
         }
 
@@ -484,10 +587,9 @@ def main() -> int:
                 yaml.dump(yaml_dict, f, sort_keys=False)
         except ImportError:
             with yaml_path.open("w", encoding="utf-8") as f:
-                f.write("merge_method: slerp\n")
-                f.write(f"base_model: {args.base}\n")
+                f.write("merge_method: linear\n")
                 f.write("dtype: bfloat16\n")
-                f.write("parameters:\n  t: 0.5\n")
+                f.write("parameters:\n  weight: 0.5\n")
                 f.write("slices:\n")
                 for s in slices:
                     f.write("- sources:\n")
@@ -499,6 +601,8 @@ def main() -> int:
                             f.write(f"      weight: {src['parameters']['weight']}\n")
                             f.write(f"      density: {src['parameters']['density']}\n")
                     f.write(f"  merge_method: {s['merge_method']}\n")
+                    if "base_model" in s:
+                        f.write(f"  base_model: {s['base_model']}\n")
                     if "parameters" in s:
                         f.write("  parameters:\n")
                         f.write(f"    t: {s['parameters']['t']}\n")
